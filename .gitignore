@@ -1,0 +1,17 @@
+# dados (mantenha dados grandes/brutos fora do git)
+data/*
+!data/.gitkeep
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
+*.egg-info/
+
+# ambiente
+.env
+
+# sistema
+.DS_Store
