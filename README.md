@@ -1,6 +1,6 @@
 # Hinge Line
 
-Método objetivo de fusão de dados gravimétricos heterogêneos (terrestres, marinhos e satélite) perto da margem continental, testado no caso da continuidade das zonas de fratura de Florianópolis (FFZ) e Rio de Janeiro (RJFZ) sob a Bacia de Santos.
+O projeto Hinge Line desenvolve um método objetivo — sustentado por critério estatístico, não por escolha visual — para separar campo regional de residual e mesclar dados gravimétricos heterogêneos (terrestres, marinhos e de satélite) na transição entre continente e oceano, onde esse tipo de análise historicamente mais falha. O método é testado num caso concreto: verificar se as zonas de fratura de Florianópolis e Rio de Janeiro, mapeadas no Atlântico Sul oceânico, de fato continuam como estruturas reais sob a margem continental brasileira, na Bacia de Santos — uma questão levantada e deixada em aberto em Carvalho et al. (2022).
 
 Dossiê completo do projeto (escopo, revista-alvo, referências, checklist): https://claude.ai/artifact/F9rq6D3L8qPhnZrCXqFPe9
 
