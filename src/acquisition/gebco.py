@@ -104,21 +104,49 @@ def wait_for_basket(basket_id: str, poll_interval: int = 5, max_wait: int = 600)
     raise TimeoutError(f"basket {basket_id} não terminou em {max_wait}s")
 
 
-def download_basket(basket_id: str, out_dir: Path, extract: bool = True, timeout: int = 300) -> Path:
-    """Baixa o .zip da basket pronta; se extract=True, também descompacta."""
+def download_basket(
+    basket_id: str,
+    out_dir: Path,
+    extract: bool = True,
+    timeout: int = 300,
+    max_retries: int = 4,
+) -> Path:
+    """Baixa o .zip da basket pronta; se extract=True, também descompacta.
+
+    A conexão com o servidor do GEBCO já se mostrou instável em downloads
+    de ~20 MB (``IncompleteRead`` no meio da transferência) mesmo com o
+    processamento já ``finished`` — por isso há retry aqui, e o zip baixado
+    é validado (``testzip``) antes de ser aceito como completo.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = out_dir / f"{basket_id}.zip"
-    resp = requests.get(f"{BASE_URL}/api/queue/download/{basket_id}", timeout=timeout, stream=True)
-    resp.raise_for_status()
-    with open(zip_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1 << 20):
-            f.write(chunk)
-    logger.info("Salvo %s (%.1f MB)", zip_path, zip_path.stat().st_size / 1e6)
-    if extract:
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(out_dir)
-        logger.info("Extraído em %s", out_dir)
-    return zip_path
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info("Baixando basket %s (tentativa %d/%d)", basket_id, attempt, max_retries)
+            resp = requests.get(f"{BASE_URL}/api/queue/download/{basket_id}", timeout=timeout, stream=True)
+            resp.raise_for_status()
+            with open(zip_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+            with zipfile.ZipFile(zip_path) as zf:
+                bad_file = zf.testzip()
+                if bad_file is not None:
+                    raise zipfile.BadZipFile(f"arquivo corrompido dentro do zip: {bad_file}")
+            logger.info("Salvo %s (%.1f MB)", zip_path, zip_path.stat().st_size / 1e6)
+            if extract:
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(out_dir)
+                logger.info("Extraído em %s", out_dir)
+            return zip_path
+        except (requests.RequestException, zipfile.BadZipFile) as exc:
+            last_exc = exc
+            logger.warning("Falha na tentativa %d: %s", attempt, exc)
+            zip_path.unlink(missing_ok=True)
+            if attempt < max_retries:
+                time.sleep(5 * attempt)
+    raise RuntimeError(f"não foi possível baixar a basket {basket_id} após {max_retries} tentativas") from last_exc
 
 
 def download_aoi(email: str, aoi: dict | None = None, out_dir: Path | None = None) -> Path:
