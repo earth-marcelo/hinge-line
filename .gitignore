@@ -1,6 +1,18 @@
 # dados (mantenha dados grandes/brutos fora do git)
 data/*
 !data/.gitkeep
+!data/raw
+!data/raw/*
+data/raw/*.xyz
+data/raw/*.csv
+data/raw/*.nc
+!data/raw/.gitkeep
+!data/raw/sandwell
+data/raw/sandwell/*
+!data/raw/sandwell/.gitkeep
+!data/processed
+data/processed/*
+!data/processed/.gitkeep
 
 # python
 __pycache__/
