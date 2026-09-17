@@ -13,6 +13,16 @@ data/raw/gebco/*
 !data/raw/emag2
 data/raw/emag2/*
 !data/raw/emag2/.gitkeep
+!data/raw/marine
+data/raw/marine/*
+!data/raw/marine/.gitkeep
+# terrestrial_cprm é exceção: o shapefile fonte é pequeno (~4MB) e não dá
+# para "rebaixar" com um script (foi um achado manual, sem API) — vale a
+# pena versionar o arquivo original. Só o CSV recortado por AOI (derivado,
+# reproduzível a partir do shapefile) fica de fora.
+!data/raw/terrestrial_cprm
+data/raw/terrestrial_cprm/*
+!data/raw/terrestrial_cprm/Gravimetria_CPRM_2022_vr1.*
 !data/processed
 data/processed/*
 !data/processed/.gitkeep
