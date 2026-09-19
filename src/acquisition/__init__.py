@@ -14,8 +14,12 @@ Cada módulo aqui cobre uma fonte de dados:
                      instantânea de levantamentos na área + pedido
                      assíncrono (fila, entrega por e-mail) dos dados
                      MGD77T. PRONTO — 28 levantamentos identificados na
-                     AOI, 1 já baixado e testado, pedido dos outros 27 em
-                     andamento.
+                     AOI; 27 baixados em 5 lotes (data/raw/marine/, .m77t
+                     bundled por lote) + V1712 de teste. Leitura/recorte
+                     por AOI e QC por levantamento contra o Sandwell:
+                     ``python -m src.acquisition.marine build`` (69.249
+                     pontos com FREEAIR na AOI, 25 levantamentos com
+                     gravimetria; OPR470 e KN210-04 sem FREEAIR).
     terrestrial.py — gravimetria terrestre, estações do SGB-CPRM (achado em
                      2026-09-17, shapefile nacional único baixado
                      manualmente do RIGEO — sem API/recorte no servidor).

@@ -57,10 +57,11 @@ import logging
 import tarfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 
-from src.config import AOI, RAW_DIR
+from src.config import AOI, PROCESSED_DIR, RAW_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,15 @@ ORDER_URL = "https://www.ngdc.noaa.gov/next-web/rest/orders"
 # mais antigos (ex.: V1712) — FREEAIR (anomalia ar-livre, mGal) é o campo de
 # gravimetria que de fato importa para a fusão com Sandwell/terrestre.
 M77T_KEEP_COLUMNS = ["SURVEY_ID", "DATE", "TIME", "LAT", "LON", "GRA_OBS", "EOTVOS", "FREEAIR", "GRA_QUALCO"]
+
+MARINE_DIR = RAW_DIR / "marine"
+SANDWELL_XYZ = RAW_DIR / "sandwell" / "sandwell_v33.1_gravity_custom.xyz"
+DEFAULT_POINTS_OUT = PROCESSED_DIR / "marine_gravity_aoi.csv"
+DEFAULT_QC_OUT = PROCESSED_DIR / "marine_survey_qc.csv"
+
+# Colunas lidas ao processar os arquivos bundled (o de 2013, KN210-04, tem
+# 3,9 milhões de linhas — só carregamos o necessário, em blocos).
+_BUNDLE_USECOLS = ["SURVEY_ID", "DATE", "TIME", "LAT", "LON", "GRA_OBS", "FREEAIR", "GRA_QUALCO"]
 
 
 def list_surveys_in_aoi(
@@ -205,6 +215,208 @@ def load_order_gravity(order_dir: Path, only_with_freeair: bool = True) -> pd.Da
     return combined
 
 
+# --------------------------------------------------------------------------
+# Leitura dos arquivos bundled (vários levantamentos por .m77t) — 2026-09-19
+#
+# Achados ao inspecionar os 5 lotes reais (ver logs/diário do projeto):
+#   * Cada lote vem como UM par MGD77_<n>.m77t/.h77t com vários levantamentos
+#     concatenados (coluna SURVEY_ID distingue). O nome do arquivo não diz
+#     quais levantamentos há dentro.
+#   * Os arquivos guardam a trilha INTEIRA de cada cruzeiro (ex.: KIR1 tem
+#     pontos em 13°E, África) — é preciso recortar pela AOI.
+#   * FREEAIR = GRA_OBS - gravidade normal (fórmula que varia por cruzeiro;
+#     NÃO soma Eötvös — GRA_OBS já vem corrigido). Onde FREEAIR existe, ele
+#     é o campo utilizável; GRA_OBS sozinho, sem FREEAIR, não serve direto.
+#   * OPR470: sem nenhuma gravimetria. KN210-04 (Knorr, 2013): só GRA_OBS a
+#     ~1 Hz, cru (resíduo contra a gravidade normal na ordem de ±10.000
+#     mGal, sem Eötvös, sem filtro, sem FREEAIR) — inutilizável sem um
+#     pré-processamento próprio; fica de fora por padrão (aparece no
+#     inventário com ``n_gra_obs_only``).
+# --------------------------------------------------------------------------
+
+
+def read_h77t(path: Path) -> pd.DataFrame:
+    """Lê o cabeçalho (.h77t, tab-delimited) — uma linha por levantamento."""
+    return pd.read_csv(path, sep="\t", dtype=str)
+
+
+def load_bundled_gravity(
+    marine_dir: Path = MARINE_DIR,
+    aoi: dict | None = None,
+    chunksize: int = 500_000,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Lê todos os ``MGD77_*.m77t`` de ``marine_dir``, recorta pela AOI e
+    mantém só pontos com FREEAIR.
+
+    Retorna ``(pontos, inventario)``:
+      * ``pontos`` — SURVEY_ID, DATETIME (UTC, NaT se ilegível), LAT, LON,
+        GRA_OBS, FREEAIR, GRA_QUALCO, SOURCE_FILE. Só linhas dentro da AOI
+        com FREEAIR preenchido.
+      * ``inventario`` — uma linha por levantamento: n_total (trilha
+        inteira), n_in_aoi, n_freeair_in_aoi, n_gra_obs_only (na AOI, tem
+        GRA_OBS mas não FREEAIR), source_file e metadados do .h77t.
+    """
+    aoi = aoi or AOI
+    files = sorted(Path(marine_dir).glob("MGD77_*.m77t"))
+    if not files:
+        raise FileNotFoundError(f"nenhum MGD77_*.m77t em {marine_dir}")
+
+    kept: list[pd.DataFrame] = []
+    counts: dict[str, dict] = {}
+    for f in files:
+        reader = pd.read_csv(
+            f,
+            sep="\t",
+            usecols=lambda c: c in _BUNDLE_USECOLS,
+            dtype={"SURVEY_ID": str, "DATE": str, "TIME": str},
+            chunksize=chunksize,
+            low_memory=False,
+        )
+        for chunk in reader:
+            in_aoi = (
+                chunk["LAT"].between(aoi["south"], aoi["north"])
+                & chunk["LON"].between(aoi["west"], aoi["east"])
+            )
+            has_fa = chunk["FREEAIR"].notna()
+            has_go = chunk["GRA_OBS"].notna()
+            for sid, grp in chunk.groupby("SURVEY_ID", sort=False):
+                c = counts.setdefault(
+                    sid,
+                    dict(SURVEY_ID=sid, source_file=f.name, n_total=0, n_in_aoi=0,
+                         n_freeair_in_aoi=0, n_gra_obs_only=0),
+                )
+                idx = grp.index
+                c["n_total"] += len(grp)
+                c["n_in_aoi"] += int(in_aoi[idx].sum())
+                c["n_freeair_in_aoi"] += int((in_aoi[idx] & has_fa[idx]).sum())
+                c["n_gra_obs_only"] += int((in_aoi[idx] & has_go[idx] & ~has_fa[idx]).sum())
+            sel = chunk[in_aoi & has_fa].copy()
+            if not sel.empty:
+                sel["SOURCE_FILE"] = f.name
+                kept.append(sel)
+        logger.info("%s processado", f.name)
+
+    if kept:
+        pts = pd.concat(kept, ignore_index=True)
+    else:
+        pts = pd.DataFrame(columns=_BUNDLE_USECOLS + ["SOURCE_FILE"])
+    # TIME vem como HHMM, às vezes com minuto fracionário (ex.: "1935.333" no M14)
+    hhmm = pd.to_numeric(pts["TIME"], errors="coerce")
+    minutes = (hhmm // 100) * 60 + (hhmm % 100)
+    pts["DATETIME"] = pd.to_datetime(pts["DATE"], format="%Y%m%d", errors="coerce") + pd.to_timedelta(minutes, unit="m")
+    pts = pts[["SURVEY_ID", "DATETIME", "LAT", "LON", "GRA_OBS", "FREEAIR", "GRA_QUALCO", "SOURCE_FILE"]]
+
+    inv = pd.DataFrame(counts.values())
+    headers = pd.concat([read_h77t(h) for h in sorted(Path(marine_dir).glob("MGD77_*.h77t"))], ignore_index=True)
+    meta_cols = [c for c in ["SURVEY_ID", "PLATFORM", "DATE_DEP", "GRAV_INSTR", "GRAV_FORMU", "GRAV_RFSYS"] if c in headers.columns]
+    inv = inv.merge(headers[meta_cols].drop_duplicates("SURVEY_ID"), on="SURVEY_ID", how="left")
+    logger.info(
+        "%d pontos com FREEAIR na AOI, %d levantamentos (%d com gravimetria utilizável)",
+        len(pts), len(inv), int((inv["n_freeair_in_aoi"] > 0).sum()),
+    )
+    return pts, inv
+
+
+def sandwell_reference(xyz_path: Path = SANDWELL_XYZ):
+    """Devolve ``f(lat, lon) -> mGal`` interpolando a grade Sandwell/Smith em disco.
+
+    Serve só como referência independente para checar levantamentos com
+    navio (QC); a grade tem ~1' e comprimento de onda mínimo maior que o do
+    gravímetro de bordo, então resíduos de alguns mGal são esperados.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    g = pd.read_csv(xyz_path, sep=r"\s+", names=["lon", "lat", "g"])
+    g["lon"] = ((g["lon"] + 180) % 360) - 180  # a API entrega 0-360
+    lons = np.sort(g["lon"].unique())
+    lats = np.sort(g["lat"].unique())
+    grid = g.pivot(index="lat", columns="lon", values="g").reindex(index=lats, columns=lons).values
+    interp = RegularGridInterpolator((lats, lons), grid, bounds_error=False, fill_value=np.nan)
+    return lambda lat, lon: interp(np.column_stack([np.asarray(lat), np.asarray(lon)]))
+
+
+def qc_by_survey(
+    points: pd.DataFrame,
+    inventory: pd.DataFrame,
+    reference,
+    min_points: int = 50,
+    mad_max: float = 5.0,
+    offset_max: float = 6.0,
+) -> pd.DataFrame:
+    """Resumo de QC por levantamento: FREEAIR do navio menos ``reference(lat, lon)``.
+
+    ``qc_status`` (limiares HEURÍSTICOS — ajustar com critério, não são
+    padrão da literatura):
+      * ``sem_gravimetria`` — nenhum ponto com FREEAIR na AOI;
+      * ``poucos_pontos``   — menos de ``min_points`` pontos (estatística frágil);
+      * ``ruidoso``         — MAD do resíduo > ``mad_max`` mGal: dado
+                              inconsistente com a referência, não só
+                              deslocado;
+      * ``offset``          — MAD ok mas |mediana| > ``offset_max``: bias
+                              constante (típico de amarração de datum),
+                              corrigível por levantamento;
+      * ``ok``              — caso contrário.
+    Atenção à circularidade: se a referência for o Sandwell, ela não deve
+    ser usada para "corrigir" o marinho que depois será fundido com ela.
+    """
+    pts = points.copy()
+    pts["_ref"] = reference(pts["LAT"].values, pts["LON"].values)
+    pts["_res"] = pts["FREEAIR"] - pts["_ref"]
+
+    def _stats(g: pd.DataFrame) -> pd.Series:
+        r = g["_res"].dropna()
+        med = r.median()
+        return pd.Series(
+            dict(
+                n_compared=len(r),
+                resid_median=med,
+                resid_mad=1.4826 * np.median(np.abs(r - med)) if len(r) else np.nan,
+                resid_p01=r.quantile(0.01) if len(r) else np.nan,
+                resid_p99=r.quantile(0.99) if len(r) else np.nan,
+                freeair_absmax=g["FREEAIR"].abs().max(),
+            )
+        )
+
+    stats = pts.groupby("SURVEY_ID").apply(_stats, include_groups=False).reset_index()
+    qc = inventory.merge(stats, on="SURVEY_ID", how="left")
+
+    def _status(row) -> str:
+        if not row["n_freeair_in_aoi"]:
+            return "sem_gravimetria"
+        if row["n_compared"] < min_points:
+            return "poucos_pontos"
+        if row["resid_mad"] > mad_max:
+            return "ruidoso"
+        if abs(row["resid_median"]) > offset_max:
+            return "offset"
+        return "ok"
+
+    qc["qc_status"] = qc.apply(_status, axis=1)
+    return qc.sort_values("SURVEY_ID").reset_index(drop=True)
+
+
+def build_marine_gravity(
+    marine_dir: Path = MARINE_DIR,
+    aoi: dict | None = None,
+    points_out: Path = DEFAULT_POINTS_OUT,
+    qc_out: Path = DEFAULT_QC_OUT,
+    sandwell_xyz: Path = SANDWELL_XYZ,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Pipeline completo: bundles -> recorte AOI -> CSV de pontos + CSV de QC.
+
+    Não descarta nada por QC — os pontos saem todos, com ``qc_status`` no
+    CSV de QC (por levantamento) para a fusão decidir o que usar.
+    """
+    pts, inv = load_bundled_gravity(marine_dir, aoi)
+    qc = qc_by_survey(pts, inv, sandwell_reference(sandwell_xyz))
+    for out in (points_out, qc_out):
+        out.parent.mkdir(parents=True, exist_ok=True)
+    pts.to_csv(points_out, index=False)
+    qc.to_csv(qc_out, index=False)
+    logger.info("Pontos salvos em %s; QC em %s", points_out, qc_out)
+    return pts, qc
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -222,6 +434,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="consulta status de um pedido")
     p_status.add_argument("--order-id", type=int, required=True)
+
+    p_build = sub.add_parser("build", help="lê os .m77t bundled, recorta pela AOI e gera CSV de pontos + QC")
+    p_build.add_argument("--marine-dir", type=Path, default=MARINE_DIR)
+    p_build.add_argument("--points-out", type=Path, default=DEFAULT_POINTS_OUT)
+    p_build.add_argument("--qc-out", type=Path, default=DEFAULT_QC_OUT)
 
     return p
 
@@ -241,6 +458,9 @@ def main() -> None:
         submit_order(survey_ids=args.survey_ids.split(","), email=args.email)
     elif args.command == "status":
         print(check_order_status(args.order_id))
+    elif args.command == "build":
+        _, qc = build_marine_gravity(args.marine_dir, points_out=args.points_out, qc_out=args.qc_out)
+        print(qc[["SURVEY_ID", "n_freeair_in_aoi", "resid_median", "resid_mad", "qc_status"]].to_string(index=False))
 
 
 if __name__ == "__main__":
