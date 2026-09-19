@@ -16,6 +16,7 @@ data/raw/emag2/*
 !data/raw/marine
 data/raw/marine/*
 !data/raw/marine/.gitkeep
+!data/raw/marine/surveys_in_aoi.json
 # terrestrial_cprm é exceção: o shapefile fonte é pequeno (~4MB) e não dá
 # para "rebaixar" com um script (foi um achado manual, sem API) — vale a
 # pena versionar o arquivo original. Só o CSV recortado por AOI (derivado,
