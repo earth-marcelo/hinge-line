@@ -44,3 +44,8 @@ venv/
 
 # sistema
 .DS_Store
+
+# RGFB: CSV pequeno, recorte da AOI (fonte do terrestrial_merge.py)
+!data/raw/rgfb
+data/raw/rgfb/*
+!data/raw/rgfb/RGFB_estacoes_AOI_Bacia_Santos.csv
