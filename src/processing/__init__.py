@@ -13,7 +13,9 @@ Submódulos:
     terrestrial_merge.py  — conjunto terrestre CPRM + RGFB (RGFB somada, não
                             calibração), ar-livre recalculado em GRS80 para todas
                             as fontes e QC das estações RGFB.
-    fusion.py             — (a implementar) fusão estatística de fontes
-                            heterogêneas (terrestre + marinho + satélite)
-                            perto da margem continental.
+    fusion.py             — fusão remove–calcula–restaura sobre o Sandwell:
+                            resíduos decimados em células de 1′, covariância
+                            terra/mar ajustada no semivariograma, ruído por
+                            fonte (CPRM = pepita), LSC local e validação
+                            cruzada em blocos para comparar as políticas.
 """
