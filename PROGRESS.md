@@ -2,6 +2,6 @@
 
 O histórico do projeto fica em `logs/`, um arquivo por sessão de trabalho relevante, nomeado por data (`AAAA-MM-DD_HHhMM.md`). Este arquivo aqui é só o índice — aponta para a entrada mais recente.
 
-**Última entrada:** [`logs/2026-09-23_19h10.md`](logs/2026-09-23_19h10.md)
+**Última entrada:** [`logs/2026-09-24_07h34.md`](logs/2026-09-24_07h34.md)
 
 Para começar uma conversa nova (comigo ou com outra pessoa) a partir de onde paramos, basta ler o log mais recente na pasta `logs/`.
