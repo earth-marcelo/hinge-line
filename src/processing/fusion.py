@@ -23,7 +23,10 @@ Tudo que é parâmetro sai dos dados, não de escolha visual:
   comprimento de correlação dependem do domínio de cada ponto (máscara terra/mar
   do GEBCO na grade; a fonte, nas observações). É positiva-definida por
   construção e se reduz à estacionária quando os dois pontos são do mesmo
-  domínio.
+  domínio. Em terra o modelo tem **duas estruturas** somadas (curta e longa;
+  ver ``LAND_TWO_STRUCTURES``), porque o semivariograma da terra tem duas
+  subidas (escala de ~5 km e de ~30 km); a soma de covariâncias de Paciorek
+  continua positiva-definida.
 * **Ruído por fonte.**
     - marinho ``ok``: σ = σ_crossover/√2 (o σ robusto dos crossovers é de uma
       diferença entre dois navios);
@@ -103,6 +106,8 @@ CV_BLOCK_DEG = 0.25
 CV_FOLDS = 5
 MARINE_POLICIES = ("ok", "ok+corrected")
 RGFB_POLICIES = ("add", "none")
+LAND_TWO_STRUCTURES = True    # False volta ao modelo antigo (um Matérn na terra), para comparar
+LAND_FIT_HMAX_KM = 60.0       # com duas estruturas, ajusta só até aqui (acima entra a tendência regional)
 
 
 # --------------------------------------------------------------------------
@@ -294,25 +299,46 @@ def empirical_variogram(b: pd.DataFrame, bins: np.ndarray = VARIO_BINS_KM,
 
 @dataclass
 class DomainCov:
-    sill: float       # variância do sinal (mGal²)
-    L: float          # km
-    nugget: float     # mGal²
+    sill: float          # estrutura 1 (curta): variância do sinal (mGal²)
+    L: float             # km
+    nugget: float
+    sill2: float = 0.0   # estrutura 2 (longa); 0 = não usada
+    L2: float = 1.0      # km (valor irrelevante quando sill2 = 0)
 
     @property
     def amp(self) -> float:
         return float(np.sqrt(self.sill))
 
+    @property
+    def amp2(self) -> float:
+        return float(np.sqrt(self.sill2))
 
-def fit_variogram(v: pd.DataFrame, min_pairs: int = 30) -> DomainCov:
-    """γ(h) = pepita + patamar·(1 − ρ(h)), mínimos quadrados ponderados
-    (peso n/γ², Cressie 1985)."""
+
+def fit_variogram(v: pd.DataFrame, min_pairs: int = 30, two_structures: bool = False,
+                  hmax: float = LAND_FIT_HMAX_KM) -> DomainCov:
+    """γ(h) = pepita + Σ_k patamar_k·(1 − ρ(h; L_k)), mínimos quadrados
+    ponderados (peso n/γ², Cressie 1985). Com duas estruturas ajusta só até
+    ``hmax`` km (acima disso entra a tendência regional, que o modelo não tem)."""
     v = v[(v["n"] >= min_pairs) & v["gamma"].notna()]
+    if two_structures:
+        v = v[v["h"] <= hmax]
     h, g, n = v["h"].to_numpy(), v["gamma"].to_numpy(), v["n"].to_numpy()
-    model = lambda h, nug, sill, L: nug + sill * (1 - matern32(h, L))  # noqa: E731
-    p0 = [max(g[0] * 0.5, 0.1), g.max(), 10.0]
-    popt, _ = curve_fit(model, h, g, p0=p0, sigma=g / np.sqrt(n),
-                        bounds=([0, 0, 0.5], [np.inf, np.inf, 500]), maxfev=20000)
-    return DomainCov(sill=float(popt[1]), L=float(popt[2]), nugget=float(popt[0]))
+
+    if not two_structures:
+        model = lambda h, nug, sill, L: nug + sill * (1 - matern32(h, L))  # noqa: E731
+        p0 = [max(g[0] * 0.5, 0.1), g.max(), 10.0]
+        popt, _ = curve_fit(model, h, g, p0=p0, sigma=g / np.sqrt(n),
+                            bounds=([0, 0, 0.5], [np.inf, np.inf, 500]), maxfev=20000)
+        return DomainCov(sill=float(popt[1]), L=float(popt[2]), nugget=float(popt[0]))
+
+    def model2(h, nug, s1, L1, s2, L2):
+        return nug + s1 * (1 - matern32(h, L1)) + s2 * (1 - matern32(h, L2))
+    p0 = [max(g[0] * 0.5, 0.1), 0.5 * g.max(), 3.0, 0.5 * g.max(), 15.0]
+    popt, _ = curve_fit(model2, h, g, p0=p0, sigma=g / np.sqrt(n),
+                        bounds=([0, 0, 0.5, 0, 8], [np.inf, np.inf, 8, np.inf, 25]),
+                        maxfev=50000)
+    return DomainCov(sill=float(popt[1]), L=float(popt[2]), nugget=float(popt[0]),
+                     sill2=float(popt[3]), L2=float(popt[4]))
 
 
 @dataclass
@@ -321,16 +347,26 @@ class CovModel:
     sea: DomainCov
     variograms: dict = field(default_factory=dict)
 
-    def params(self, is_land: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        amp = np.where(is_land, self.land.amp, self.sea.amp)
-        L = np.where(is_land, self.land.L, self.sea.L)
-        return amp, L
+    def params(self, is_land: np.ndarray) -> tuple:
+        """(amp1, L1, amp2, L2) por ponto, conforme o domínio."""
+        l, s = self.land, self.sea
+        w = lambda a, b: np.where(is_land, a, b)  # noqa: E731
+        return w(l.amp, s.amp), w(l.L, s.L), w(l.amp2, s.amp2), w(l.L2, s.L2)
 
-    def cov(self, h, amp_a, L_a, amp_b, L_b) -> np.ndarray:
-        """Covariância não estacionária de Paciorek (2D, isotrópica por ponto)."""
-        L2 = 0.5 * (L_a ** 2 + L_b ** 2)
-        pref = (L_a * L_b) / L2
-        return amp_a * amp_b * pref * matern32(h, np.sqrt(L2))
+    def prior_std(self, is_land: np.ndarray) -> np.ndarray:
+        """Desvio-padrão a priori do sinal (soma das duas estruturas)."""
+        a1, _, a2, _ = self.params(is_land)
+        return np.sqrt(a1 ** 2 + a2 ** 2)
+
+    def cov(self, h, A: tuple, B: tuple) -> np.ndarray:
+        """Covariância não estacionária de Paciorek (2D, isotrópica por ponto),
+        somada sobre as duas estruturas. A e B = (amp1, L1, amp2, L2) de cada
+        ponto, já com shape compatível com ``h``."""
+        out = 0.0
+        for aa, La, ab, Lb in ((A[0], A[1], B[0], B[1]), (A[2], A[3], B[2], B[3])):
+            L2 = 0.5 * (La ** 2 + Lb ** 2)
+            out = out + aa * ab * (La * Lb / L2) * matern32(h, np.sqrt(L2))
+        return out
 
     def table(self) -> pd.DataFrame:
         return pd.DataFrame({d: vars(getattr(self, d)) for d in ("land", "sea")}).T
@@ -340,13 +376,14 @@ def fit_covariance(b: pd.DataFrame) -> CovModel:
     """Covariância por domínio a partir dos resíduos decimados."""
     vl = empirical_variogram(b[b["domain"] == "land"])
     vs = empirical_variogram(b[b["domain"] == "sea"])
-    cov = CovModel(fit_variogram(vl), fit_variogram(vs), {"land": vl, "sea": vs})
+    cov = CovModel(fit_variogram(vl, two_structures=LAND_TWO_STRUCTURES), fit_variogram(vs),
+                   {"land": vl, "sea": vs})
     for name in ("land", "sea"):
         d = getattr(cov, name)
-        if d.sill < 0.05 * d.nugget:
+        if d.sill + d.sill2 < 0.05 * d.nugget:
             logger.warning("%s: sem sinal estruturado no resíduo (patamar %.2f ≪ pepita %.2f) "
                            "— a correção nesse domínio será ~0 e o produto fica no Sandwell",
-                           name, d.sill, d.nugget)
+                           name, d.sill + d.sill2, d.nugget)
     logger.info("covariância:\n%s", cov.table().round(2).to_string())
     return cov
 
@@ -374,23 +411,23 @@ def lsc_predict(obs: pd.DataFrame, tgt_lat: np.ndarray, tgt_lon: np.ndarray,
     """Correção prevista (média zero) e desvio-padrão nos alvos.
 
     Para cada alvo usa os ``k`` vizinhos mais próximos a ≤ ``max_radius_km``.
-    Alvos sem vizinho: correção 0 e erro = amplitude do sinal do domínio.
+    Alvos sem vizinho: correção 0 e erro = desvio-padrão a priori do domínio.
     """
     # observações de domínio sem sinal (patamar 0) têm peso nulo: fora da
     # busca de vizinhos, para não ocuparem as k vagas de quem informa
-    o_amp, _ = cov.params((obs["domain"] == "land").to_numpy())
-    obs = obs[o_amp > 0]
+    obs = obs[cov.prior_std((obs["domain"] == "land").to_numpy()) > 0]
     oxy = _xy_km(obs["lat"].to_numpy(), obs["lon"].to_numpy())
-    o_amp, o_L = cov.params((obs["domain"] == "land").to_numpy())
+    o_par = cov.params((obs["domain"] == "land").to_numpy())
     o_r = obs["r"].to_numpy()
     o_nv = obs["sigma"].to_numpy() ** 2
     txy = _xy_km(tgt_lat, tgt_lon)
-    t_amp, t_L = cov.params(tgt_land)
+    t_par = cov.params(tgt_land)
+    t_std = cov.prior_std(tgt_land)
 
     n_obs = len(obs)
     k = min(k, n_obs)
     pred = np.zeros(len(txy))
-    err = t_amp.astype(float).copy()
+    err = t_std.astype(float).copy()
     if n_obs == 0:
         return pred, err
     tree = cKDTree(oxy)
@@ -404,18 +441,17 @@ def lsc_predict(obs: pd.DataFrame, tgt_lat: np.ndarray, tgt_lon: np.ndarray,
         idx = np.where(valid, idx, 0)
         p = oxy[idx]                                            # (B,k,2)
         hh = np.linalg.norm(p[:, :, None, :] - p[:, None, :, :], axis=-1)
-        C = cov.cov(hh, o_amp[idx][:, :, None], o_L[idx][:, :, None],
-                    o_amp[idx][:, None, :], o_L[idx][:, None, :])
+        P = tuple(a[idx] for a in o_par)                        # cada um (B,k)
+        C = cov.cov(hh, tuple(a[:, :, None] for a in P), tuple(a[:, None, :] for a in P))
         C += np.eye(k)[None] * o_nv[idx][:, None, :]
-        c = cov.cov(np.where(valid, dist, 0.0), o_amp[idx], o_L[idx],
-                    t_amp[ti][:, None], t_L[ti][:, None])
+        c = cov.cov(np.where(valid, dist, 0.0), P, tuple(a[ti][:, None] for a in t_par))
         # vizinhos inexistentes: linha/coluna identidade e c = 0 → peso 0
         vv = valid[:, :, None] & valid[:, None, :]
         C = np.where(vv, C, np.eye(k)[None])
         c = np.where(valid, c, 0.0)
         w = np.linalg.solve(C, c[..., None])[..., 0]
         pred[ti] = (w * np.where(valid, o_r[idx], 0.0)).sum(1)
-        err[ti] = np.sqrt(np.clip(t_amp[ti] ** 2 - (w * c).sum(1), 0, None))
+        err[ti] = np.sqrt(np.clip(t_std[ti] ** 2 - (w * c).sum(1), 0, None))
     return pred, err
 
 
